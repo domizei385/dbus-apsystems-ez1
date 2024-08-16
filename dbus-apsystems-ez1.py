@@ -4,6 +4,7 @@ import asyncio
 import platform
 import threading
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 from APsystemsEZ1 import APsystemsEZ1M
@@ -14,6 +15,7 @@ else:
     from gi.repository import GLib as gobject
 import sys
 import time
+from datetime import datetime
 import configparser  # for config/ini file
 
 # our own packages from victron
@@ -21,12 +23,11 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__),
                 '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python'))
 from vedbus import VeDbusService
 
-
 class DbusApSystemsEZ1Service:
-    def __init__(self, servicename, paths, productname='ApSystems EZ1', connection='ApSystems Api'):
-        config = self._getConfig()
-        deviceinstance = int(config['DEFAULT']['Deviceinstance'])
-        customname = config['DEFAULT']['CustomName']
+    def __init__(self, servicename, paths, productname='ApSystems EZ1'):
+        self.config = self._getConfig()
+        deviceinstance = int(self.config['DEFAULT']['Deviceinstance'])
+        customname = self.config['DEFAULT']['CustomName']
 
         self._dbusservice = VeDbusService(
             "{}.tcp_{:02d}".format(servicename, deviceinstance))
@@ -38,8 +39,8 @@ class DbusApSystemsEZ1Service:
         # Create the management objects, as specified in the ccgx dbus-api document
         self._dbusservice.add_path('/Mgmt/ProcessName', __file__)
         self._dbusservice.add_path(
-            '/Mgmt/ProcessVersion', 'Unkown version, and running on Python ' + platform.python_version())
-        self._dbusservice.add_path('/Mgmt/Connection', connection)
+            '/Mgmt/ProcessVersion', 'Unknown version, and running on Python ' + platform.python_version())
+        # self._dbusservice.add_path('/Mgmt/Connection', connection)
 
         # Create the mandatory objects
         self._dbusservice.add_path('/DeviceInstance', deviceinstance)
@@ -49,12 +50,13 @@ class DbusApSystemsEZ1Service:
         self._dbusservice.add_path('/ProductName', productname)
         self._dbusservice.add_path('/CustomName', customname)
         self._dbusservice.add_path('/Connected', 1)
+        self._dbusservice.add_path('/LastConnected', None)
 
         self._dbusservice.add_path('/Latency', None)
         self._dbusservice.add_path(
             '/HardwareVersion', self._getHWVersion())
         self._dbusservice.add_path(
-            '/Position', int(config['DEFAULT']['Position']))
+            '/Position', int(self.config['DEFAULT']['Position']))
         self._dbusservice.add_path('/Serial', self._getSerial())
         self._dbusservice.add_path('/UpdateIndex', 0)
         # Dummy path so VRM detects us as a PV-inverter.
@@ -70,9 +72,14 @@ class DbusApSystemsEZ1Service:
 
         # add _update function 'timer'
         # pause x ms before the next request
-        self._updateInterval = int(config['DEFAULT']['UpdateInterval'])
+        self._updateInterval = int(self.config['DEFAULT']['UpdateInterval'])
 
     async def start(self):
+        address = self.config['DEFAULT']['Address']
+        port = int(self.config['DEFAULT']['Port'])
+
+        self._client = APsystemsEZ1M(ip_address=address, port=port)
+
         loop = asyncio.get_event_loop()
         data_update = loop.create_task(self._update_loop())
         loop.create_task(self._signOfLife())
@@ -80,13 +87,11 @@ class DbusApSystemsEZ1Service:
 
     async def _update_loop(self):
         while True:
-            await self._update()
-            await asyncio.sleep(self._updateInterval)
+            result = await self._update()
+            await asyncio.sleep(self._updateInterval if result else 60)
 
     def _getSerial(self):
-        config = self._getConfig()
-        serial = config['DEFAULT']['Serial']
-        return serial
+        return self.config['DEFAULT']['Serial']
 
     def _getHWVersion(self):
         return 1.0
@@ -98,8 +103,7 @@ class DbusApSystemsEZ1Service:
         return config
 
     def _getSignOfLifeInterval(self):
-        config = self._getConfig()
-        value = config['DEFAULT']['SignOfLifeLog']
+        value = self.config['DEFAULT']['SignOfLifeLog']
 
         if not value:
             value = 0
@@ -107,18 +111,13 @@ class DbusApSystemsEZ1Service:
         return int(value)
 
     async def _getData(self):
-        config = self._getConfig()
-        address = config['DEFAULT']['Address']
-        port = int(config['DEFAULT']['Port'])
-
-        client = APsystemsEZ1M(ip_address=address, port=port)
-
         try:
-            data = await client.get_output_data()
+            data = await self._client.get_output_data()
             acEnergyForward = float(data.e1 + data.e2) if data else None
             acPower = float(data.p1 + data.p2) if data else None
         except Exception as e:
-            logging.critical('Error at %s', '_update', exc_info=e)
+            return None
+            #logging.critical('Error at %s', '_update', exc_info=e)
 
         return {
             "acEnergyForward": acEnergyForward,
@@ -139,29 +138,31 @@ class DbusApSystemsEZ1Service:
         try:
             # get data from apsystems
             data = await self._getData()
-            config = self._getConfig()
 
-            phase = str(config['DEFAULT']['Phase'])
+            phase = str(self.config['DEFAULT']['Phase'])
             # send data to DBus
             pre = '/Ac/' + phase
 
-            self._dbusservice[pre + '/Voltage'] = data['acVoltage']
-            self._dbusservice[pre + '/Current'] = data['acCurrent']
-            self._dbusservice[pre + '/Power'] = data['acPower']
-            self._dbusservice[pre + '/Energy/Forward'] = data['acEnergyForward']
+            self._dbusservice[pre + '/Voltage'] = data['acVoltage'] if data else 0.0
+            self._dbusservice[pre + '/Current'] = data['acCurrent']  if data else 0.0
+            self._dbusservice[pre + '/Power'] = data['acPower']  if data else 0.0
+            self._dbusservice['/Connected'] = 1 if data else 0
             self._dbusservice['/Ac/Voltage'] = self._dbusservice[pre + '/Voltage']
             self._dbusservice['/Ac/Current'] = self._dbusservice[pre + '/Current']
             self._dbusservice['/Ac/Power'] = self._dbusservice[pre + '/Power']
-            self._dbusservice['/Ac/Energy/Forward'] = self._dbusservice[pre + '/Energy/Forward']
-            self._dbusservice['/Connected'] = 1
-            
+            if data:
+                self._dbusservice[pre + '/Energy/Forward'] = data['acEnergyForward']
+                self._dbusservice['/Ac/Energy/Forward'] = self._dbusservice[pre + '/Energy/Forward']
+                # update lastupdate vars
+                self._lastUpdate = time.time()
+                now = datetime.now()
+                self._dbusservice['/LastConnected'] = now.strftime("%Y-%m-%d %H:%M:%S")
+
             # logging
             logging.debug("Consumption (/Ac/Power): %s" %(self._dbusservice['/Ac/Power']))
             logging.debug("Forward (/Ac/Energy/Forward): %s" %(self._dbusservice['/Ac/Energy/Forward']))
             logging.debug("---")
 
-            # update lastupdate vars
-            self._lastUpdate = time.time()
         except Exception as e:
             logging.critical('Error at %s', '_update', exc_info=e)
 
@@ -187,15 +188,13 @@ class DbusApSystemsEZ1Service:
         logging.debug("someone else updated %s to %s" % (path, value))
         return True  # accept the change
 
-
 async def main():
     # configure logging
     logging.basicConfig(format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S',
                         level=logging.INFO,
                         handlers=[
-                            logging.FileHandler(
-                                "%s/current.log" % (os.path.dirname(os.path.realpath(__file__)))),
+                            RotatingFileHandler("%s/current.log" % (os.path.dirname(os.path.realpath(__file__))), maxBytes=1024*1024, backupCount=5),
                             logging.StreamHandler()
                         ])
 
@@ -218,19 +217,19 @@ async def main():
             paths={
                 # energy produced by pv inverter
                 '/Ac/Energy/Forward': {'initial': None, 'textformat': _kwh},
-                '/Ac/Power': {'initial': 0, 'textformat': _w},
-                '/Ac/Current': {'initial': 0, 'textformat': _a},
-                '/Ac/Voltage': {'initial': 0, 'textformat': _v},
+                '/Ac/Power': {'initial': 0.0, 'textformat': _w},
+                '/Ac/Current': {'initial': 0.0, 'textformat': _a},
+                '/Ac/Voltage': {'initial': 0.0, 'textformat': _v},
 
-                '/Ac/L1/Voltage': {'initial': 0, 'textformat': _v},
-                '/Ac/L2/Voltage': {'initial': 0, 'textformat': _v},
-                '/Ac/L3/Voltage': {'initial': 0, 'textformat': _v},
-                '/Ac/L1/Current': {'initial': 0, 'textformat': _a},
-                '/Ac/L2/Current': {'initial': 0, 'textformat': _a},
-                '/Ac/L3/Current': {'initial': 0, 'textformat': _a},
-                '/Ac/L1/Power': {'initial': 0, 'textformat': _w},
-                '/Ac/L2/Power': {'initial': 0, 'textformat': _w},
-                '/Ac/L3/Power': {'initial': 0, 'textformat': _w},
+                '/Ac/L1/Voltage': {'initial': 0.0, 'textformat': _v},
+                '/Ac/L2/Voltage': {'initial': 0.0, 'textformat': _v},
+                '/Ac/L3/Voltage': {'initial': 0.0, 'textformat': _v},
+                '/Ac/L1/Current': {'initial': 0.0, 'textformat': _a},
+                '/Ac/L2/Current': {'initial': 0.0, 'textformat': _a},
+                '/Ac/L3/Current': {'initial': 0.0, 'textformat': _a},
+                '/Ac/L1/Power': {'initial': 0.0, 'textformat': _w},
+                '/Ac/L2/Power': {'initial': 0.0, 'textformat': _w},
+                '/Ac/L3/Power': {'initial': 0.0, 'textformat': _w},
                 '/Ac/L1/Energy/Forward': {'initial': None, 'textformat': _kwh},
                 '/Ac/L2/Energy/Forward': {'initial': None, 'textformat': _kwh},
                 '/Ac/L3/Energy/Forward': {'initial': None, 'textformat': _kwh},
